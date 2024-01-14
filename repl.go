@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash"
@@ -247,7 +248,10 @@ func decodeWALData(hasher hash.Hash, walData []byte, relations map[uint32]*pglog
 			return false, fmt.Errorf("insert: unknown relation ID %d", logicalMsg.RelationID)
 		}
 
-		hasher.Write(walData)
+		relName := rel.Namespace + "." + rel.RelationName
+		insertData := encodeInsertMsg(relName, &logicalMsg.InsertMessage)
+		log.Printf("insertData %x", insertData)
+		hasher.Write(insertData)
 
 		values, err := tuplColVals(logicalMsg.Tuple.Columns, rel)
 		if err != nil {
@@ -277,7 +281,9 @@ func decodeWALData(hasher hash.Hash, walData []byte, relations map[uint32]*pglog
 		log.Printf(" [msg] UPDATE rel %v.%v: %v (%v) => %v\n", rel.Namespace, rel.RelationName,
 			mustMarshal(oldValues), rune(logicalMsg.OldTupleType), mustMarshal(newValues))
 
-		hasher.Write(walData)
+		relName := rel.Namespace + "." + rel.RelationName
+		updateData := encodeUpdateMsg(relName, &logicalMsg.UpdateMessage)
+		hasher.Write(updateData)
 
 	case *pglogrepl.DeleteMessageV2:
 		rel, ok := relations[logicalMsg.RelationID]
@@ -292,19 +298,19 @@ func decodeWALData(hasher hash.Hash, walData []byte, relations map[uint32]*pglog
 
 		log.Printf(" [msg] DELETE from rel %v.%v: %v\n", rel.Namespace, rel.RelationName, mustMarshal(oldValues))
 
-		hasher.Write(walData)
+		relName := rel.Namespace + "." + rel.RelationName
+		deleteData := encodeDeleteMsg(relName, &logicalMsg.DeleteMessage)
+		hasher.Write(deleteData)
 
 	case *pglogrepl.TruncateMessageV2:
 		log.Printf(" [msg] TRUNCATE relations: %v\n", logicalMsg.RelationIDs)
 
-		hasher.Write(walData)
+		hasher.Write(encodeTruncateMsg(&logicalMsg.TruncateMessage))
 
 	case *pglogrepl.TypeMessageV2:
 		log.Println(" [msg] type message", logicalMsg.Name, logicalMsg.Namespace, logicalMsg.DataType)
-
 	case *pglogrepl.OriginMessage:
 		log.Println(" [msg] origin message", logicalMsg.Name, logicalMsg.CommitLSN)
-
 	case *pglogrepl.LogicalDecodingMessageV2:
 		log.Printf(" [msg] logical decoding message: %q, %q, %d\n", logicalMsg.Prefix, logicalMsg.Content, logicalMsg.Xid)
 
@@ -354,4 +360,52 @@ func tuplColVals(cols []*pglogrepl.TupleDataColumn, rel *pglogrepl.RelationMessa
 		}
 	}
 	return values, nil
+}
+
+var pgIntCoder = binary.BigEndian
+
+func encodeTupleData(td *pglogrepl.TupleData) []byte {
+	if td == nil {
+		return []byte{0}
+	}
+	var data []byte
+	data = pgIntCoder.AppendUint16(data, td.ColumnNum)
+	for _, col := range td.Columns {
+		data = append(data, col.DataType)
+
+		switch col.DataType {
+		case pglogrepl.TupleDataTypeText, pglogrepl.TupleDataTypeBinary:
+			pgIntCoder.AppendUint32(data, col.Length) // len(col.Data)
+			data = append(data, col.Data...)
+		case pglogrepl.TupleDataTypeNull, pglogrepl.TupleDataTypeToast:
+		}
+	}
+	return data
+}
+
+func encodeInsertMsg(relName string, im *pglogrepl.InsertMessage) []byte {
+	data := []byte(relName) // RelationID is dependent on the deployment
+	return append(data, encodeTupleData(im.Tuple)...)
+}
+
+func encodeUpdateMsg(relName string, um *pglogrepl.UpdateMessage) []byte {
+	data := []byte(relName) // RelationID is dependent on the deployment
+	data = append(data, um.OldTupleType)
+	data = append(data, encodeTupleData(um.OldTuple)...)
+	return append(data, encodeTupleData(um.NewTuple)...)
+}
+
+func encodeDeleteMsg(relName string, um *pglogrepl.DeleteMessage) []byte {
+	data := []byte(relName) // RelationID is dependent on the deployment
+	data = append(data, um.OldTupleType)
+	return append(data, encodeTupleData(um.OldTuple)...)
+}
+
+func encodeTruncateMsg(tm *pglogrepl.TruncateMessage) []byte {
+	data := pgIntCoder.AppendUint32(nil, tm.RelationNum)
+	data = append(data, tm.Option)
+	for _, rid := range tm.RelationIDs {
+		data = pgIntCoder.AppendUint32(data, rid)
+	}
+	return data
 }
