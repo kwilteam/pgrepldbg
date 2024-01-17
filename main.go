@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"log"
@@ -56,18 +57,23 @@ func mainCore(ctx context.Context) error {
 	ctx, cancel := context.WithDeadline(ctx, time.Now().Add(dur))
 	defer cancel()
 
-	const slotName = "kwild_repl"
+	const slotName = "kwild_repl_debug"
 	commitChan, errChan, err := startRepl(ctx, conn, publicationName, slotName)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Listening for WAL messages on replication slot %q\n", publicationName)
+	log.Printf("Listening for WAL messages on replication slot %q\n", slotName)
 
 	for {
 		select {
-		case commitHash := <-commitChan:
-			log.Printf("Commit HASH: %x\n", commitHash)
+		case commitID := <-commitChan:
+			if len(commitID) <= 8 {
+				log.Printf("bad commit ID %x", commitID)
+			}
+			seq := int64(binary.BigEndian.Uint64(commitID))
+			commitHash := commitID[8:]
+			log.Printf("Commit HASH: %x (seq %d)\n", commitHash, seq)
 		case err = <-errChan: // wait for startRepl's goroutine complete
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil

@@ -117,6 +117,7 @@ func startRepl(ctx context.Context, conn *pgconn.PgConn, publicationName, slotNa
 		relations := map[uint32]*pglogrepl.RelationMessageV2{}
 
 		var inStream bool
+		var seq int64 = -1
 
 		for {
 			if ctx.Err() != nil {
@@ -178,10 +179,13 @@ func startRepl(ctx context.Context, conn *pgconn.PgConn, publicationName, slotNa
 					return
 				}
 
-				commit, err := decodeWALData(hasher, xld.WALData, relations, &inStream)
+				commit, anySeq, err := decodeWALData(hasher, xld.WALData, relations, &inStream)
 				if err != nil {
 					done <- fmt.Errorf("decodeWALData failed: %w", err)
 					return
+				}
+				if anySeq != -1 {
+					seq = anySeq
 				}
 
 				var lsnDelta uint64
@@ -195,9 +199,11 @@ func startRepl(ctx context.Context, conn *pgconn.PgConn, publicationName, slotNa
 
 				if commit {
 					cHash := hasher.Sum(nil)
-					commitHash <- cHash
+					cid := binary.BigEndian.AppendUint64(nil, uint64(seq))
+					cid = append(cid, cHash...)
+					commitHash <- cid
 					hasher.Reset() // hasher = sha256.New()
-					log.Printf("Commit id %x, LSN %v (%d) delta %d\n", cHash[:6], xld.WALStart, xld.WALStart, lsnDelta)
+					log.Printf("Commit id %x, seq %d, LSN %v (%d) delta %d\n", cHash[:6], seq, xld.WALStart, xld.WALStart, lsnDelta)
 				}
 			}
 		}
@@ -213,14 +219,15 @@ func mustMarshal(vals map[string]any) string {
 }
 
 func decodeWALData(hasher hash.Hash, walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2,
-	inStream *bool) (bool, error) {
+	inStream *bool) (bool, int64, error) {
 	logicalMsg, err := pglogrepl.ParseV2(walData, *inStream)
 	if err != nil {
-		return false, fmt.Errorf("Parse logical replication message: %w", err)
+		return false, 0, fmt.Errorf("Parse logical replication message: %w", err)
 	}
 
 	// log.Printf("### Receive a logical replication message: <%s>\n", logicalMsg.Type())
 
+	var seq int64 = -1
 	var done bool // set to true on receipt of a commit to signal the the end of a transaction
 
 	switch logicalMsg := logicalMsg.(type) {
@@ -245,7 +252,7 @@ func decodeWALData(hasher hash.Hash, walData []byte, relations map[uint32]*pglog
 	case *pglogrepl.InsertMessageV2:
 		rel, ok := relations[logicalMsg.RelationID]
 		if !ok {
-			return false, fmt.Errorf("insert: unknown relation ID %d", logicalMsg.RelationID)
+			return false, 0, fmt.Errorf("insert: unknown relation ID %d", logicalMsg.RelationID)
 		}
 
 		relName := rel.Namespace + "." + rel.RelationName
@@ -255,7 +262,7 @@ func decodeWALData(hasher hash.Hash, walData []byte, relations map[uint32]*pglog
 
 		values, err := tuplColVals(logicalMsg.Tuple.Columns, rel)
 		if err != nil {
-			return false, err
+			return false, 0, err
 		}
 
 		log.Printf(" [msg] INSERT into %v.%v: %v\n", rel.Namespace, rel.RelationName, mustMarshal(values))
@@ -263,19 +270,36 @@ func decodeWALData(hasher hash.Hash, walData []byte, relations map[uint32]*pglog
 	case *pglogrepl.UpdateMessageV2:
 		rel, ok := relations[logicalMsg.RelationID]
 		if !ok {
-			return false, fmt.Errorf("insert: unknown relation ID %d", logicalMsg.RelationID)
+			return false, 0, fmt.Errorf("insert: unknown relation ID %d", logicalMsg.RelationID)
+		}
+
+		if rel.Namespace == `kwild_internal` && rel.RelationName == `sentry` {
+			cols := logicalMsg.NewTuple.Columns
+			if len(cols) != 1 {
+				log.Printf("WARNING: not one column (%d)", len(cols))
+			}
+			seq, err = cols[0].Int64()
+			if err != nil {
+				log.Printf("WARNING: wasn't an int64: %v", err)
+				if len(cols[0].Data) != 0 {
+					log.Printf("WARNING: still wasn't an int64: %v", err)
+				} else {
+					seq = int64(binary.BigEndian.Uint64(cols[0].Data))
+				}
+			}
+			log.Printf("seq %d", seq)
 		}
 
 		var oldValues map[string]any
 		if logicalMsg.OldTuple != nil { // seems to be only if primary key changes
 			oldValues, err = tuplColVals(logicalMsg.OldTuple.Columns, rel)
 			if err != nil {
-				return false, err
+				return false, 0, err
 			}
 		}
 		newValues, err := tuplColVals(logicalMsg.NewTuple.Columns, rel)
 		if err != nil {
-			return false, err
+			return false, 0, err
 		}
 
 		log.Printf(" [msg] UPDATE rel %v.%v: %v (%v) => %v\n", rel.Namespace, rel.RelationName,
@@ -288,12 +312,12 @@ func decodeWALData(hasher hash.Hash, walData []byte, relations map[uint32]*pglog
 	case *pglogrepl.DeleteMessageV2:
 		rel, ok := relations[logicalMsg.RelationID]
 		if !ok {
-			return false, fmt.Errorf("insert: unknown relation ID %d", logicalMsg.RelationID)
+			return false, 0, fmt.Errorf("insert: unknown relation ID %d", logicalMsg.RelationID)
 		}
 
 		oldValues, err := tuplColVals(logicalMsg.OldTuple.Columns, rel)
 		if err != nil {
-			return false, err
+			return false, 0, err
 		}
 
 		log.Printf(" [msg] DELETE from rel %v.%v: %v\n", rel.Namespace, rel.RelationName, mustMarshal(oldValues))
@@ -330,7 +354,7 @@ func decodeWALData(hasher hash.Hash, walData []byte, relations map[uint32]*pglog
 		log.Printf("Unknown message type in pgoutput stream: %T\n", logicalMsg)
 	}
 
-	return done, nil
+	return done, seq, nil
 }
 
 func decodeTextColumnData(data []byte, dataType uint32) (interface{}, error) {
